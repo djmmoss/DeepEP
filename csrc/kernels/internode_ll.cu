@@ -126,7 +126,7 @@ void clean_low_latency_buffer(int* clean_0,
                   sync_buffer_ptr);
 }
 
-template <bool kUseFP8, bool kUseUE8M0, int kHidden>
+template <bool kUseFP8, bool kUseUE8M0, bool kUseMXFP8, int kHidden>
 __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
                                                     void* packed_recv_x_scales,
                                                     int* packed_recv_src_info,
@@ -164,13 +164,15 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
     const auto sub_warp_id = warp_id % num_warps_per_group;
     const auto responsible_expert_idx = sm_id * num_warp_groups + warp_group_id;
 
-    // May extract UE8M0 from the scales
-    using scale_t = std::conditional_t<kUseUE8M0, uint8_t, float>;
+    // MXFP8 stores one E8M0 byte per 32 values. Legacy UE8M0 keeps FP32 scales
+    // on the wire and packs them into uint32_t on receive.
+    using scale_t = std::conditional_t<kUseUE8M0 || kUseMXFP8, uint8_t, float>;
+    using send_scale_t = std::conditional_t<kUseMXFP8, uint8_t, float>;
     using packed_t = std::conditional_t<kUseUE8M0, uint32_t, float>;
     EP_STATIC_ASSERT(sizeof(packed_t) % sizeof(scale_t) == 0, "Invalid vector length");
 
     // FP8 staffs
-    constexpr int kNumPerChannels = 128;
+    constexpr int kNumPerChannels = kUseMXFP8 ? 32 : 128;
     const int num_scales = kHidden / kNumPerChannels;
     const size_t hidden_bytes = kHidden * (kUseFP8 ? sizeof(__nv_fp8_storage_t) : sizeof(nv_bfloat16));
     const size_t hidden_int4 = hidden_bytes / sizeof(int4);
@@ -178,7 +180,8 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
     // Message package: index at source (int), 3 reserved int fields, hidden data, FP8 scales
     // NOTES: currently we have 3 reserved int fields for future use
     using vec_t = std::conditional_t<kUseFP8, int2, int4>;
-    const size_t num_bytes_per_msg = sizeof(int4) + (kUseFP8 ? (kHidden + num_scales * sizeof(float)) : (kHidden * sizeof(nv_bfloat16)));
+    const size_t num_bytes_per_msg =
+        sizeof(int4) + (kUseFP8 ? (kHidden + num_scales * sizeof(send_scale_t)) : (kHidden * sizeof(nv_bfloat16)));
     const size_t num_int4_per_msg = num_bytes_per_msg / sizeof(int4);
     EP_DEVICE_ASSERT(num_bytes_per_msg % sizeof(int4) == 0);
 
@@ -204,7 +207,7 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
             const auto x_int4 = static_cast<const int4*>(x) + token_idx * hidden_bf16_int4;
             const auto rdma_x_src_idx = reinterpret_cast<int*>(static_cast<uint8_t*>(rdma_x) + token_idx * num_bytes_per_msg);
             const auto rdma_x_vec = reinterpret_cast<vec_t*>(reinterpret_cast<uint8_t*>(rdma_x_src_idx) + sizeof(int4));
-            const auto rdma_x_scales = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(rdma_x_vec) + hidden_bytes);
+            const auto rdma_x_scales = reinterpret_cast<send_scale_t*>(reinterpret_cast<uint8_t*>(rdma_x_vec) + hidden_bytes);
 
             // Overlap top-k index read and source token index writes
             auto dst_expert_idx = warp_id < num_topk ? static_cast<int>(__ldg(topk_idx + token_idx * num_topk + warp_id)) : -1;
@@ -229,11 +232,22 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
                     }
 
                     // Reduce amax and scale
-                    EP_STATIC_ASSERT(kNumElemsPerRead * 32 / kNumPerChannels == 2, "Invalid vectorization");
-                    amax = warp_reduce_max<16>(amax);
+                    constexpr int kNumLanesPerScale = kNumPerChannels / kNumElemsPerRead;
+                    EP_STATIC_ASSERT(kNumPerChannels % kNumElemsPerRead == 0, "Invalid MXFP8 vectorization");
+                    EP_STATIC_ASSERT(kNumElemsPerRead * 32 % kNumPerChannels == 0, "Invalid vectorization");
+                    amax = warp_reduce_max<kNumLanesPerScale>(amax);
                     calculate_fp8_scales(amax, scale, scale_inv, round_scale);
-                    if (lane_id == 0 or lane_id == 16)
-                        rdma_x_scales[i * kNumElemsPerRead / 128] = scale_inv;
+                    // Lanes 0, kNumLanesPerScale, ... own the scale groups.
+                    // MXFP8 therefore writes 8 E8M0 bytes per warp iteration;
+                    // legacy 128-wide FP8 writes 2 FP32 scale values.
+                    if (lane_id % kNumLanesPerScale == 0) {
+                        const auto scale_idx = i * kNumElemsPerRead / kNumPerChannels;
+                        if constexpr (kUseMXFP8) {
+                            rdma_x_scales[scale_idx] = extract_required_scale_format<true>(scale_inv);
+                        } else {
+                            rdma_x_scales[scale_idx] = scale_inv;
+                        }
+                    }
 
                     // Cast into send buffer
                     vec_t int2_value;
@@ -371,8 +385,10 @@ LOW_LATENCY_DISPATCH_RECV:
         const auto recv_src_info = packed_recv_src_info + local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank;
         const auto recv_range = packed_recv_layout_range + local_expert_idx * num_ranks;
         const auto num_aligned_scales = align_up<int>(num_scales, sizeof(float) / sizeof(scale_t));
+        const auto token_scale_stride = align_up<int>(num_ranks * num_max_dispatch_tokens_per_rank, 128);
         const auto recv_x_scales = static_cast<scale_t*>(packed_recv_x_scales) +
-            local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank * num_aligned_scales;
+            (kUseMXFP8 ? local_expert_idx * token_scale_stride * num_scales
+                       : local_expert_idx * num_ranks * num_max_dispatch_tokens_per_rank * num_aligned_scales);
 
         // Shared between sub-warps in warp groups
         __shared__ int shared_num_recv_tokens[kNumMaxWarpGroups], shared_recv_token_begin_idx[kNumMaxWarpGroups];
@@ -422,7 +438,6 @@ LOW_LATENCY_DISPATCH_RECV:
         recv_token_begin_idx = shared_recv_token_begin_idx[warp_group_id];
 
         // Copy tokens
-        EP_DEVICE_ASSERT(num_scales <= 64);
         for (int i = sub_warp_id; i < num_recv_tokens; i += num_warps_per_group) {
             // Copy source info
             const auto src_src_idx = reinterpret_cast<int*>(rdma_recv_x_uint8 + i * num_bytes_per_msg);
@@ -438,24 +453,27 @@ LOW_LATENCY_DISPATCH_RECV:
 
             // Copy scales
             if constexpr (kUseFP8) {
-                // Equivalent CuTe layout:
-                //   (num_tokens, (num_packed, num_elems_per_pack)):(num_elems_per_pack, (num_tokens * num_elems_per_pack, 1))
-                const auto src_scales = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(src_data) + hidden_bytes);
-                const auto num_elems_per_pack = static_cast<int>(sizeof(packed_t) / sizeof(scale_t));
+                // Send-side scale storage is asymmetric: MXFP8 sends native
+                // E8M0 bytes, while legacy UE8M0 derives packed bytes here.
+                const auto src_scales = reinterpret_cast<send_scale_t*>(reinterpret_cast<uint8_t*>(src_data) + hidden_bytes);
                 const auto token_idx = recv_token_begin_idx + i;
-                const auto token_stride = num_elems_per_pack;
-                const auto pack_stride = num_ranks * num_max_dispatch_tokens_per_rank * num_elems_per_pack;
-                if (lane_id < num_scales) {
-                    const auto pack_idx = lane_id / num_elems_per_pack;
-                    const auto elem_idx = lane_id % num_elems_per_pack;
-                    auto scale = extract_required_scale_format<kUseUE8M0>(ld_nc_global(src_scales + lane_id));
-                    recv_x_scales[token_idx * token_stride + pack_idx * pack_stride + elem_idx] = scale;
-                }
-                if (lane_id + 32 < num_scales) {
-                    const auto pack_idx = (lane_id + 32) / num_elems_per_pack;
-                    const auto elem_idx = (lane_id + 32) % num_elems_per_pack;
-                    auto scale = extract_required_scale_format<kUseUE8M0>(ld_nc_global(src_scales + lane_id + 32));
-                    recv_x_scales[token_idx * token_stride + pack_idx * pack_stride + elem_idx] = scale;
+                // Stride by lane so MXFP8's hidden / 32 scale bytes are copied
+                // for hidden sizes with more scale groups than lanes.
+                for (int scale_idx = lane_id; scale_idx < num_scales; scale_idx += 32) {
+                    auto scale = ld_nc_global(src_scales + scale_idx);
+                    if constexpr (kUseMXFP8) {
+                        recv_x_scales[token_idx * num_scales + scale_idx] = scale;
+                    } else {
+                        // Equivalent CuTe layout:
+                        //   (num_tokens, (num_packed, num_elems_per_pack)):(num_elems_per_pack, (num_tokens * num_elems_per_pack, 1))
+                        const auto num_elems_per_pack = static_cast<int>(sizeof(packed_t) / sizeof(scale_t));
+                        const auto token_stride = num_elems_per_pack;
+                        const auto pack_stride = num_ranks * num_max_dispatch_tokens_per_rank * num_elems_per_pack;
+                        const auto pack_idx = scale_idx / num_elems_per_pack;
+                        const auto elem_idx = scale_idx % num_elems_per_pack;
+                        recv_x_scales[token_idx * token_stride + pack_idx * pack_stride + elem_idx] =
+                            extract_required_scale_format<kUseUE8M0>(scale);
+                    }
                 }
             }
         }
@@ -487,6 +505,7 @@ void dispatch(void* packed_recv_x,
               bool use_fp8,
               bool round_scale,
               bool use_ue8m0,
+              bool use_mxfp8,
               void* workspace,
               int num_device_sms,
               cudaStream_t stream,
@@ -507,16 +526,23 @@ void dispatch(void* packed_recv_x,
     EP_HOST_ASSERT(num_experts * sizeof(int) * 2 <= NUM_WORKSPACE_BYTES);
 
     // FP8 checks
+    if (use_mxfp8) {
+        EP_HOST_ASSERT(use_fp8 and "MXFP8 dispatch requires `use_fp8=True`");
+        EP_HOST_ASSERT(round_scale and "MXFP8 dispatch requires `round_scale=True`");
+        EP_HOST_ASSERT(use_ue8m0 and "MXFP8 dispatch requires `use_ue8m0=True`");
+    }
     if (use_ue8m0)
         EP_HOST_ASSERT(round_scale and "UE8M0 SF requires `round_scale=True`");
 
 #define DISPATCH_LAUNCH_CASE(hidden)                         \
     {                                                        \
-        auto dispatch_func = dispatch<false, false, hidden>; \
+        auto dispatch_func = dispatch<false, false, false, hidden>; \
         if (use_fp8 and not use_ue8m0)                       \
-            dispatch_func = dispatch<true, false, hidden>;   \
+            dispatch_func = dispatch<true, false, false, hidden>;   \
         if (use_fp8 and use_ue8m0)                           \
-            dispatch_func = dispatch<true, true, hidden>;    \
+            dispatch_func = dispatch<true, true, false, hidden>;    \
+        if (use_mxfp8)                                       \
+            dispatch_func = dispatch<true, true, true, hidden>;     \
         LAUNCH_KERNEL(&cfg,                                  \
                       dispatch_func,                         \
                       packed_recv_x,                         \

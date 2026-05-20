@@ -1,4 +1,5 @@
 import os
+import platform
 import subprocess
 import setuptools
 import importlib
@@ -15,7 +16,29 @@ def get_nvshmem_host_lib_name(base_dir):
     raise ModuleNotFoundError('libnvshmem_host.so not found')
 
 
+def get_cuda_cccl_include_dir(cuda_home):
+    machine = platform.machine().lower()
+    targets = []
+    if machine in ('x86_64', 'amd64'):
+        targets.append('x86_64-linux')
+    elif machine in ('aarch64', 'arm64'):
+        targets.extend(('aarch64-linux', 'sbsa-linux'))
+
+    for target in targets:
+        candidate = cuda_home / 'targets' / target / 'include' / 'cccl'
+        if candidate.exists():
+            return candidate
+
+    for candidate in sorted((cuda_home / 'targets').glob('*/include/cccl')):
+        if candidate.exists():
+            return candidate
+
+    candidate = cuda_home / 'include' / 'cccl'
+    return candidate if candidate.exists() else None
+
+
 if __name__ == '__main__':
+    project_root = Path(__file__).parent.resolve()
     disable_nvshmem = False
     nvshmem_dir = os.getenv('NVSHMEM_DIR', None)
     nvshmem_host_lib = 'libnvshmem_host.so'
@@ -34,11 +57,18 @@ if __name__ == '__main__':
 
     if not disable_nvshmem:
         assert os.path.exists(nvshmem_dir), f'The specified NVSHMEM directory does not exist: {nvshmem_dir}'
+        nvshmem_host_lib = get_nvshmem_host_lib_name(nvshmem_dir)
 
     cxx_flags = ['-O3', '-Wno-deprecated-declarations', '-Wno-unused-variable', '-Wno-sign-compare', '-Wno-reorder', '-Wno-attributes']
     nvcc_flags = ['-O3', '-Xcompiler', '-O3']
     sources = ['csrc/deep_ep.cpp', 'csrc/kernels/runtime.cu', 'csrc/kernels/layout.cu', 'csrc/kernels/intranode.cu']
-    include_dirs = ['csrc/']
+    cuda_home = Path(os.getenv('CUDA_HOME', '/usr/local/cuda'))
+    include_dirs = [
+        str(project_root / 'csrc'),
+    ]
+    cccl_include_dir = get_cuda_cccl_include_dir(cuda_home)
+    if cccl_include_dir is not None:
+        include_dirs.append(str(cccl_include_dir))
     library_dirs = []
     nvcc_dlink = []
     extra_link_args = []

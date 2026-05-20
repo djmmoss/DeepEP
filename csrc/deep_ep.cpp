@@ -1417,15 +1417,21 @@ Buffer::low_latency_dispatch(const torch::Tensor& x,
                              bool use_fp8,
                              bool round_scale,
                              bool use_ue8m0,
+                             bool use_mxfp8,
                              bool async,
                              bool return_recv_hook) {
 #ifndef DISABLE_NVSHMEM
     EP_HOST_ASSERT(low_latency_mode);
 
     // Tensor checks
-    // By default using `ptp128c` FP8 cast
+    // By default using `ptp128c` FP8 cast. MXFP8 uses per-32 E8M0 scales.
     EP_HOST_ASSERT(x.dim() == 2 and x.is_contiguous() and x.scalar_type() == torch::kBFloat16);
     EP_HOST_ASSERT(x.size(1) % sizeof(int4) == 0 and x.size(1) % 128 == 0);
+    if (use_mxfp8) {
+        EP_HOST_ASSERT(use_fp8 and "MXFP8 dispatch requires FP8 dispatch");
+        EP_HOST_ASSERT(round_scale and "MXFP8 dispatch requires E8M0 power-of-two scales");
+        EP_HOST_ASSERT(use_ue8m0 and "MXFP8 dispatch requires E8M0 scale format");
+    }
     EP_HOST_ASSERT(topk_idx.dim() == 2 and topk_idx.is_contiguous());
     EP_HOST_ASSERT(x.size(0) == topk_idx.size(0) and x.size(0) <= num_max_dispatch_tokens_per_rank);
     EP_HOST_ASSERT(topk_idx.scalar_type() == c10::CppTypeToScalarType<topk_idx_t>::value);
@@ -1477,7 +1483,13 @@ Buffer::low_latency_dispatch(const torch::Tensor& x,
     if (use_fp8) {
         // TODO: support unaligned cases
         EP_HOST_ASSERT(hidden % 512 == 0);
-        if (not use_ue8m0) {
+        if (use_mxfp8) {
+            const auto scale_stride = align_up(num_ranks * num_max_dispatch_tokens_per_rank, 128);
+            // Keep padded scale rows finite for vectorized downstream readers;
+            // byte 0 decodes to a tiny E8M0 scale rather than NaN/Inf.
+            packed_recv_x_scales = torch::zeros({num_local_experts, scale_stride, hidden / 32},
+                                                torch::dtype(torch::kUInt8).device(torch::kCUDA));
+        } else if (not use_ue8m0) {
             packed_recv_x_scales = torch::empty({num_local_experts, hidden / 128, num_ranks * num_max_dispatch_tokens_per_rank},
                                                 torch::dtype(torch::kFloat32).device(torch::kCUDA));
         } else {
@@ -1485,7 +1497,9 @@ Buffer::low_latency_dispatch(const torch::Tensor& x,
             packed_recv_x_scales = torch::empty({num_local_experts, hidden / 512, num_ranks * num_max_dispatch_tokens_per_rank},
                                                 torch::dtype(torch::kInt).device(torch::kCUDA));
         }
-        packed_recv_x_scales = torch::transpose(packed_recv_x_scales.value(), 1, 2);
+        if (not use_mxfp8) {
+            packed_recv_x_scales = torch::transpose(packed_recv_x_scales.value(), 1, 2);
+        }
         packed_recv_x_scales_ptr = packed_recv_x_scales->data_ptr();
     }
 
@@ -1518,6 +1532,7 @@ Buffer::low_latency_dispatch(const torch::Tensor& x,
             use_fp8,
             round_scale,
             use_ue8m0,
+            use_mxfp8,
             workspace,
             num_device_sms,
             launch_stream,

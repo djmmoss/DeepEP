@@ -238,6 +238,7 @@ public:
                          bool use_fp8,
                          bool round_scale,
                          bool use_ue8m0,
+                         bool use_mxfp8,
                          bool async,
                          bool return_recv_hook);
 
