@@ -457,8 +457,8 @@ LOW_LATENCY_DISPATCH_RECV:
                 // E8M0 bytes, while legacy UE8M0 derives packed bytes here.
                 const auto src_scales = reinterpret_cast<send_scale_t*>(reinterpret_cast<uint8_t*>(src_data) + hidden_bytes);
                 const auto token_idx = recv_token_begin_idx + i;
-                // Stride by lane so MXFP8's hidden / 32 scale bytes are copied
-                // for hidden sizes with more scale groups than lanes.
+                // Stride by lane so native MXFP8 copies all scale bytes,
+                // including hidden sizes with num_scales > 64.
                 for (int scale_idx = lane_id; scale_idx < num_scales; scale_idx += 32) {
                     auto scale = ld_nc_global(src_scales + scale_idx);
                     if constexpr (kUseMXFP8) {
@@ -534,17 +534,17 @@ void dispatch(void* packed_recv_x,
     if (use_ue8m0)
         EP_HOST_ASSERT(round_scale and "UE8M0 SF requires `round_scale=True`");
 
-#define DISPATCH_LAUNCH_CASE(hidden)                         \
-    {                                                        \
+#define DISPATCH_LAUNCH_CASE(hidden)                              \
+    {                                                             \
         auto dispatch_func = dispatch<false, false, false, hidden>; \
-        if (use_fp8 and not use_ue8m0)                       \
-            dispatch_func = dispatch<true, false, false, hidden>;   \
-        if (use_fp8 and use_ue8m0)                           \
-            dispatch_func = dispatch<true, true, false, hidden>;    \
-        if (use_mxfp8)                                       \
-            dispatch_func = dispatch<true, true, true, hidden>;     \
-        LAUNCH_KERNEL(&cfg,                                  \
-                      dispatch_func,                         \
+        if (use_mxfp8)                                            \
+            dispatch_func = dispatch<true, true, true, hidden>;    \
+        else if (use_fp8 and use_ue8m0)                           \
+            dispatch_func = dispatch<true, true, false, hidden>;   \
+        else if (use_fp8)                                         \
+            dispatch_func = dispatch<true, false, false, hidden>;  \
+        LAUNCH_KERNEL(&cfg,                                       \
+                      dispatch_func,                              \
                       packed_recv_x,                         \
                       packed_recv_x_scales,                  \
                       packed_recv_src_info,                  \
