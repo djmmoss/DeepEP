@@ -194,8 +194,7 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
         goto LOW_LATENCY_DISPATCH_RECV;
 
     // There are 2 kinds of warps in this part:
-    // 1. The first-kind warps for FP8 cast. Their trailing `num_topk` warps
-    //    also send top-k tokens, keeping them separate from the count warp.
+    // 1. The first-kind warps for FP8 cast and sending top-k tokens
     // 2. The last warp for reading `topk_idx` and count for per-expert information
     if (warp_id < num_warps - 1) {
         constexpr int kNumElemsPerRead = sizeof(int4) / sizeof(nv_bfloat16);
@@ -211,9 +210,7 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
             const auto rdma_x_scales = reinterpret_cast<send_scale_t*>(reinterpret_cast<uint8_t*>(rdma_x_vec) + hidden_bytes);
 
             // Overlap top-k index read and source token index writes
-            const auto send_warp_begin = num_warps - 1 - num_topk;
-            const auto topk_slot = warp_id - send_warp_begin;
-            auto dst_expert_idx = topk_slot >= 0 ? static_cast<int>(__ldg(topk_idx + token_idx * num_topk + topk_slot)) : -1;
+            auto dst_expert_idx = warp_id < num_topk ? static_cast<int>(__ldg(topk_idx + token_idx * num_topk + warp_id)) : -1;
             thread_id == 0 ? (*rdma_x_src_idx = token_idx) : 0;
 
             // FP8 cast
